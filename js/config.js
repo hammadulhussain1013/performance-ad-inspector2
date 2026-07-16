@@ -40,10 +40,56 @@ const AppConfig = (() => {
     landscape: { ratio: 1.91, label: '1.91:1 Landscape' },
   };
 
+  const PLACEMENT_SPECS = {
+    feed: {
+      label: 'Feed',
+      ratios: [1, 4 / 5, 1.91],
+      preferredRatio: 4 / 5,
+      standardizedSize: '1080x1350 preferred',
+      alternates: ['1080x1080', '1200x628'],
+      tolerance: 0.045,
+    },
+    story: {
+      label: 'Story',
+      ratios: [9 / 16],
+      preferredRatio: 9 / 16,
+      standardizedSize: '1080x1920 master',
+      alternates: [],
+      tolerance: 0.025,
+    },
+    reels: {
+      label: 'Reels',
+      ratios: [9 / 16],
+      preferredRatio: 9 / 16,
+      standardizedSize: '1080x1920 master',
+      alternates: [],
+      tolerance: 0.025,
+    },
+    carousel: {
+      label: 'Carousel',
+      ratios: [1, 4 / 5],
+      preferredRatio: 1,
+      standardizedSize: '1080x1080 preferred',
+      alternates: ['1080x1350'],
+      tolerance: 0.045,
+    },
+  };
+
   const SAFE_ZONES = {
     feed: { top: 0.02, bottom: 0.02, left: 0.02, right: 0.02 },
     story: { top: 0.14, bottom: 0.20, left: 0.06, right: 0.06 },
     reels: { top: 0.14, bottom: 0.34, left: 0.06, right: 0.12 },
+  };
+
+  const ADVANCED_RESEARCH = {
+    provider: 'groq',
+    endpoint: 'https://api.groq.com/openai/v1/chat/completions',
+    model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+    apiKey: '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',
+    imageMaxEdge: 1280,
+    maxBase64Bytes: 4 * 1024 * 1024,
+    requestTimeoutMs: 120000,
+    temperature: 0.2,
   };
 
   function ratingFor(score) {
@@ -53,8 +99,10 @@ const AppConfig = (() => {
   return {
     CATEGORIES,
     PLATFORM_RATIOS,
+    PLACEMENT_SPECS,
     RATING_BANDS,
     SAFE_ZONES,
+    ADVANCED_RESEARCH,
     ratingFor,
   };
 })();
