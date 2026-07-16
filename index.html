@@ -200,6 +200,21 @@
               </div>
             </div>
 
+            <div class="mb-5">
+              <p class="text-[10px] font-mono uppercase tracking-wider text-mist-500 mb-2">Analysis mode</p>
+              <div class="grid grid-cols-2 gap-2">
+                <button id="mode-fast-btn" type="button" class="analysis-mode-btn active-analysis-mode text-xs font-medium border border-ink-600 rounded-lg py-2.5 transition-colors">
+                  Fast local audit
+                </button>
+                <button id="mode-advanced-btn" type="button" class="analysis-mode-btn text-xs font-medium border border-ink-600 rounded-lg py-2.5 transition-colors">
+                  Advanced research
+                </button>
+              </div>
+              <p id="analysis-mode-help" class="text-xs text-mist-500 mt-2 leading-relaxed">
+                Fast local audit stays in your browser. Advanced research sends a compressed image to Groq Cloud for a deeper visual review.
+              </p>
+            </div>
+
             <button id="analyze-btn" class="w-full bg-mint-500 hover:bg-mint-600 text-ink-950 font-semibold rounded-lg py-3.5 transition-colors flex items-center justify-center gap-2">
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
               Analyze creative
@@ -363,6 +378,7 @@
 
 <script src="js/config.js"></script>
 <script src="js/imageAnalysis.js"></script>
+<script src="js/advancedAnalysis.js"></script>
 <script src="js/canvasOverlays.js"></script>
 <script src="js/render.js"></script>
 <script src="js/main.js"></script>
