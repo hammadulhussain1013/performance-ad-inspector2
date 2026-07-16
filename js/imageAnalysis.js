@@ -1,16 +1,14 @@
 /* ==========================================================================
    imageAnalysis.js
-   Everything here is computed from actual pixels of the uploaded image.
-   There is no randomness and no server round-trip. Since pixel analysis
-   cannot reliably read offer copy, logos, or trust badges, categories that
-   need semantic understanding are scored conservatively and say so clearly.
-
-   Public entry point: ImageAnalysis.runHeuristicAnalysis(imgElement)
-   Returns a Promise<AnalysisResult>.
+   Browser-side heuristic scoring derived from image pixels. The goal is not
+   perfect computer vision; it is a differentiated, stable creative audit that
+   uses measurable composition signals instead of placeholder scores.
    ========================================================================== */
 
 const ImageAnalysis = (() => {
   const WORK_SIZE = 480;
+  const GRID_ROWS = 4;
+  const GRID_COLS = 4;
 
   function extractMetrics(img) {
     const w = img.naturalWidth || img.width;
@@ -27,8 +25,9 @@ const ImageAnalysis = (() => {
     const { data } = ctx.getImageData(0, 0, cw, ch);
 
     const lum = new Float32Array(cw * ch);
-    let satSum = 0;
+    const histogram = new Uint32Array(256);
     const colorBuckets = new Map();
+    let satSum = 0;
 
     for (let i = 0, p = 0; i < data.length; i += 4, p++) {
       const r = data[i];
@@ -36,6 +35,7 @@ const ImageAnalysis = (() => {
       const b = data[i + 2];
       const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
       lum[p] = l;
+      histogram[Math.round(l)]++;
 
       const max = Math.max(r, g, b);
       const min = Math.min(r, g, b);
@@ -73,21 +73,51 @@ const ImageAnalysis = (() => {
     const avgEdge = edgeSum / totalPixels;
 
     const TEXT_EDGE_THRESHOLD = 60;
+    const FLAT_THRESHOLD = 8;
     let sharpCount = 0;
+    let flatCount = 0;
+    let hotPixelCount = 0;
+
     for (let i = 0; i < edge.length; i++) {
       if (edge[i] > TEXT_EDGE_THRESHOLD) sharpCount++;
-    }
-    const textDensity = sharpCount / totalPixels;
-
-    const FLAT_THRESHOLD = 8;
-    let flatCount = 0;
-    for (let i = 0; i < edge.length; i++) {
       if (edge[i] < FLAT_THRESHOLD) flatCount++;
+      if (edge[i] > avgEdge * 1.9) hotPixelCount++;
     }
-    const flatRatio = flatCount / totalPixels;
 
-    const grid = buildRegionGrid(lum, edge, cw, ch, 3, 3);
+    const textDensity = sharpCount / totalPixels;
+    const flatRatio = flatCount / totalPixels;
+    const hotSpotCoverage = hotPixelCount / totalPixels;
+
+    const grid = buildRegionGrid(lum, edge, cw, ch, GRID_ROWS, GRID_COLS);
+    const edgeSummary = summarizeGrid(grid);
     const distinctColors = colorBuckets.size;
+    const dominantColorShare = Math.max(...colorBuckets.values(), 1) / totalPixels;
+    const dynamicRange = (
+      percentileFromHistogram(histogram, totalPixels, 0.9) -
+      percentileFromHistogram(histogram, totalPixels, 0.1)
+    ) / 255;
+
+    const zoneAverages = {
+      top: rectMean(edge, cw, ch, 0, 1, 0, 0.32),
+      middle: rectMean(edge, cw, ch, 0, 1, 0.32, 0.68),
+      bottom: rectMean(edge, cw, ch, 0, 1, 0.68, 1),
+      topCenter: rectMean(edge, cw, ch, 0.22, 0.78, 0, 0.36),
+      center: rectMean(edge, cw, ch, 0.24, 0.76, 0.24, 0.76),
+      bottomCenter: rectMean(edge, cw, ch, 0.3, 0.7, 0.64, 1),
+      bottomSides: (
+        rectMean(edge, cw, ch, 0, 0.24, 0.64, 1) +
+        rectMean(edge, cw, ch, 0.76, 1, 0.64, 1)
+      ) / 2,
+      left: rectMean(edge, cw, ch, 0, 0.33, 0, 1),
+      right: rectMean(edge, cw, ch, 0.67, 1, 0, 1),
+      topLeft: rectMean(edge, cw, ch, 0, 0.2, 0, 0.2),
+      topRight: rectMean(edge, cw, ch, 0.8, 1, 0, 0.2),
+      bottomLeft: rectMean(edge, cw, ch, 0, 0.2, 0.8, 1),
+      bottomRight: rectMean(edge, cw, ch, 0.8, 1, 0.8, 1),
+    };
+
+    zoneAverages.topCorners = (zoneAverages.topLeft + zoneAverages.topRight) / 2;
+    zoneAverages.bottomCorners = (zoneAverages.bottomLeft + zoneAverages.bottomRight) / 2;
 
     return {
       width: w,
@@ -96,12 +126,21 @@ const ImageAnalysis = (() => {
       ch,
       avgSaturation,
       contrastStddev: stddev,
+      dynamicRange,
       avgEdge,
       textDensity,
       flatRatio,
+      hotSpotCoverage,
       distinctColors,
+      dominantColorShare,
       grid,
       ratio: w / h,
+      zoneAverages,
+      dominance: edgeSummary.dominance,
+      edgeEntropy: edgeSummary.entropy,
+      edgeCentroid: computeEdgeCentroid(edge, cw, ch),
+      lateralBalance: edgeSummary.lateralBalance,
+      safeZoneActivity: computeSafeZoneActivity(edge, cw, ch, avgEdge),
     };
   }
 
@@ -141,225 +180,369 @@ const ImageAnalysis = (() => {
     return cells;
   }
 
+  function summarizeGrid(grid) {
+    const values = grid.flat().map((cell) => cell.meanEdge);
+    const maxEdge = Math.max(...values, 0.001);
+    const sum = values.reduce((acc, value) => acc + value, 0);
+    const mean = sum / values.length;
+    const dominance = maxEdge / (mean + 0.001);
+    const entropy = normalizedEntropy(values);
+
+    const cols = grid[0].length;
+    let left = 0;
+    let right = 0;
+    values.forEach((value, idx) => {
+      const col = idx % cols;
+      if (col < cols / 2) left += value;
+      else right += value;
+    });
+
+    return {
+      dominance,
+      entropy,
+      lateralBalance: 1 - Math.abs(left - right) / (left + right + 0.001),
+    };
+  }
+
+  function percentileFromHistogram(histogram, totalPixels, percentile) {
+    const threshold = totalPixels * percentile;
+    let cumulative = 0;
+    for (let i = 0; i < histogram.length; i++) {
+      cumulative += histogram[i];
+      if (cumulative >= threshold) return i;
+    }
+    return 255;
+  }
+
+  function rectMean(edge, cw, ch, left, right, top, bottom) {
+    const x0 = Math.max(0, Math.floor(left * cw));
+    const x1 = Math.min(cw, Math.ceil(right * cw));
+    const y0 = Math.max(0, Math.floor(top * ch));
+    const y1 = Math.min(ch, Math.ceil(bottom * ch));
+    let sum = 0;
+    let count = 0;
+
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        sum += edge[y * cw + x];
+        count++;
+      }
+    }
+
+    return count ? sum / count : 0;
+  }
+
+  function normalizedEntropy(values) {
+    const total = values.reduce((sum, value) => sum + value, 0);
+    if (!total) return 1;
+
+    let entropy = 0;
+    values.forEach((value) => {
+      if (!value) return;
+      const p = value / total;
+      entropy -= p * Math.log2(p);
+    });
+
+    return entropy / Math.log2(values.length);
+  }
+
+  function computeEdgeCentroid(edge, cw, ch) {
+    let sum = 0;
+    let xSum = 0;
+    let ySum = 0;
+
+    for (let y = 0; y < ch; y++) {
+      for (let x = 0; x < cw; x++) {
+        const weight = edge[y * cw + x];
+        sum += weight;
+        xSum += x * weight;
+        ySum += y * weight;
+      }
+    }
+
+    if (!sum) {
+      return { x: 0.5, y: 0.5 };
+    }
+
+    return {
+      x: xSum / sum / cw,
+      y: ySum / sum / ch,
+    };
+  }
+
+  function computeSafeZoneActivity(edge, cw, ch, avgEdge) {
+    const result = {};
+    const denominator = avgEdge + 0.001;
+
+    Object.entries(AppConfig.SAFE_ZONES).forEach(([platform, zone]) => {
+      const top = rectMean(edge, cw, ch, 0, 1, 0, zone.top);
+      const bottom = rectMean(edge, cw, ch, 0, 1, 1 - zone.bottom, 1);
+      const left = rectMean(edge, cw, ch, 0, zone.left, zone.top, 1 - zone.bottom);
+      const right = rectMean(edge, cw, ch, 1 - zone.right, 1, zone.top, 1 - zone.bottom);
+      const unsafeMean = (top + bottom + left + right) / 4;
+      result[platform] = clamp(unsafeMean / denominator / 1.15, 0, 1);
+    });
+
+    return result;
+  }
+
   function classifyAspectRatio(ratio) {
-    const specs = AppConfig.PLATFORM_RATIOS;
+    const ratios = AppConfig.PLATFORM_RATIOS;
+    const placementSpecs = AppConfig.PLACEMENT_SPECS;
     let closest = null;
     let closestDiff = Infinity;
 
-    for (const key in specs) {
-      const diff = Math.abs(ratio - specs[key].ratio);
+    Object.keys(ratios).forEach((key) => {
+      const diff = Math.abs(ratio - ratios[key].ratio);
       if (diff < closestDiff) {
         closestDiff = diff;
         closest = key;
       }
-    }
+    });
 
-    const tolerance = 0.06;
-    const compatibility = {
-      feed: Math.abs(ratio - 1) < tolerance || Math.abs(ratio - 4 / 5) < tolerance,
-      story: Math.abs(ratio - 9 / 16) < tolerance,
-      reels: Math.abs(ratio - 9 / 16) < tolerance,
-      carousel: Math.abs(ratio - 1) < tolerance || Math.abs(ratio - 4 / 5) < tolerance,
-    };
+    const compatibility = {};
+    Object.entries(placementSpecs).forEach(([key, spec]) => {
+      compatibility[key] = spec.ratios.some((targetRatio) => Math.abs(ratio - targetRatio) < spec.tolerance);
+    });
 
     return {
       ratioValue: ratio,
-      nearest: specs[closest].label,
-      exactMatch: closestDiff < tolerance,
+      nearest: ratios[closest].label,
+      exactMatch: closestDiff < 0.025,
+      matchStrength: clamp(1 - closestDiff / 0.14, 0, 1),
       compatibility,
+      standardizedSizes: Object.fromEntries(
+        Object.entries(placementSpecs).map(([key, spec]) => [key, spec.standardizedSize])
+      ),
     };
   }
 
   function scoreHeuristically(m) {
     const cat = {};
-    const PIXEL_CAVEAT = ' (pixel-based estimate - text, logos, and offer details are judged conservatively)';
+    const PIXEL_CAVEAT = ' (pixel-based estimate - semantic claims are inferred from composition, not OCR-perfect reading)';
+    const contrastNorm = clamp((m.contrastStddev / 72) * 0.65 + m.dynamicRange * 0.5, 0, 1);
+    const busyPenalty = clamp((m.textDensity - 0.06) / 0.16, 0, 1);
+    const focus = clamp(((m.dominance - 1) / 1.2) * 0.55 + (1 - m.edgeEntropy) * 0.45, 0, 1);
+    const centerDistance = Math.hypot(m.edgeCentroid.x - 0.5, m.edgeCentroid.y - 0.5);
+    const centeredness = 1 - clamp(centerDistance / 0.45, 0, 1);
+    const topRatio = m.zoneAverages.top / (m.avgEdge + 0.001);
+    const topCenterRatio = m.zoneAverages.topCenter / (m.avgEdge + 0.001);
+    const centerRatio = m.zoneAverages.center / (m.avgEdge + 0.001);
+    const bottomCenterRatio = m.zoneAverages.bottomCenter / (m.avgEdge + 0.001);
+    const cornerRatio = Math.max(
+      m.zoneAverages.topLeft,
+      m.zoneAverages.topRight,
+      m.zoneAverages.bottomLeft,
+      m.zoneAverages.bottomRight
+    ) / (m.avgEdge + 0.001);
 
-    const contrastNorm = clamp(m.contrastStddev / 70, 0, 1);
     cat.contrast = {
       score: round(contrastNorm * 5),
-      reason: contrastNorm > 0.7
-        ? 'Strong tonal separation between light and dark regions - elements pop against their background.'
-        : contrastNorm > 0.4
-          ? 'Moderate tonal contrast. Some elements likely blend into their surroundings.'
-          : 'Low tonal contrast across the frame - foreground elements risk disappearing into the background, especially on small mobile screens.',
-      recommendation: contrastNorm > 0.7
-        ? 'Maintain this contrast range in future creative - it is reading clearly.'
-        : 'Push the darkest darks darker and lightest lights lighter, or add a scrim behind text or CTA to separate it from the background.',
+      reason: contrastNorm > 0.72
+        ? 'Strong tonal separation and usable dynamic range make the key elements stand apart from the background.'
+        : contrastNorm > 0.46
+          ? 'Moderate contrast. The frame is readable, but some important elements likely blend at mobile-scroll size.'
+          : 'Low contrast and compressed tonal range flatten the frame, so key elements will struggle to pop.',
+      recommendation: contrastNorm > 0.72
+        ? 'Keep this contrast profile in future variants.'
+        : 'Increase local contrast around the headline, product, or CTA by darkening the backdrop or adding a scrim.',
     };
 
-    const busyPenalty = clamp(m.textDensity / 0.18, 0, 1);
-    const readabilityRaw = contrastNorm * 0.6 + (1 - busyPenalty) * 0.4;
+    const readabilityRaw = clamp(contrastNorm * 0.45 + (1 - busyPenalty) * 0.35 + focus * 0.2, 0, 1);
     cat.readability = {
       score: round(readabilityRaw * 10),
-      reason: readabilityRaw > 0.7
-        ? 'Clean tonal separation and controlled visual density - the frame should read quickly at feed scroll speed.'
+      reason: readabilityRaw > 0.72
+        ? 'The frame should scan quickly on a phone: contrast is solid, clutter is controlled, and attention is not overly fragmented.'
         : readabilityRaw > 0.45
-          ? 'Readable but not effortless - either contrast or visual density is working against fast scanning.'
-          : 'Dense, low-contrast composition. At thumbnail size on a phone this will be hard to parse in the second it gets.',
-      recommendation: 'Cut anything that is not the headline, product, or CTA. Increase font weight and size on any on-image text before adding more elements.',
+          ? 'Readable, but not frictionless. Either clutter, low contrast, or too many competing hotspots slow comprehension.'
+          : 'This composition is likely hard to parse at thumb-scroll speed because it is both busy and low in separation.',
+      recommendation: 'Reduce competing details, increase spacing around the primary message, and give text or CTA a clearer backing shape.',
     };
 
-    const idealFlat = 0.55;
-    const flatDeviation = Math.abs(m.flatRatio - idealFlat) / idealFlat;
-    const whitespaceRaw = clamp(1 - flatDeviation, 0, 1);
+    const idealFlat = 0.5;
+    const whitespaceRaw = clamp(
+      1 - Math.abs(m.flatRatio - idealFlat) / idealFlat * 0.75 - busyPenalty * 0.2,
+      0,
+      1
+    );
     cat.whitespace = {
       score: round(whitespaceRaw * 10),
-      reason: m.flatRatio > idealFlat + 0.15
-        ? 'A very large share of the frame is visually flat - the creative may feel empty or under-designed.'
+      reason: whitespaceRaw > 0.68
+        ? 'Breathing room is in a healthy range: the frame feels designed rather than crowded or empty.'
         : m.flatRatio < idealFlat - 0.15
-          ? 'Very little breathing room - elements are packed edge to edge with no visual rest for the eye.'
-          : 'Balanced ratio of active elements to breathing room.',
+          ? 'The frame is dense edge-to-edge, leaving very little negative space to help the eye prioritize.'
+          : 'A large portion of the frame is visually quiet, which risks making the creative feel under-built or low-energy.',
       recommendation: m.flatRatio < idealFlat - 0.15
-        ? 'Remove or consolidate at least one element and increase padding around the headline, product, and CTA.'
-        : 'Whitespace balance is solid - keep future variants within this range.',
+        ? 'Strip back at least one secondary element and increase padding around the main subject.'
+        : 'Use empty space more deliberately by tightening the composition around the strongest element.',
     };
 
-    const cellEdges = m.grid.flat().map((cell) => cell.meanEdge);
-    const maxEdge = Math.max(...cellEdges);
-    const meanCellEdge = cellEdges.reduce((a, b) => a + b, 0) / cellEdges.length;
-    const dominance = meanCellEdge > 0 ? (maxEdge - meanCellEdge) / (maxEdge + 0.001) : 0;
-    const hierarchyRaw = clamp(dominance * 1.4, 0, 1);
+    const hierarchyRaw = clamp(focus * 0.7 + m.lateralBalance * 0.15 + centeredness * 0.15, 0, 1);
     cat.visual_hierarchy = {
       score: round(hierarchyRaw * 15),
-      reason: hierarchyRaw > 0.6
-        ? 'One clear focal region dominates the composition - the eye has an obvious place to land first.'
-        : hierarchyRaw > 0.3
-          ? 'A focal point exists but competes with one or two other busy regions.'
-          : 'Visual weight is spread evenly across the frame - nothing tells the eye where to look first.',
-      recommendation: 'Establish one clear focal point, usually the product or headline, and quiet everything else around it. Size, contrast, and isolation all create hierarchy.',
+      reason: hierarchyRaw > 0.68
+        ? 'There is a clear focal order: one area dominates, and the rest of the frame supports it.'
+        : hierarchyRaw > 0.4
+          ? 'A focal point exists, but several other active regions still compete for first attention.'
+          : 'Visual weight is spread too evenly, so the eye is not told where to land first.',
+      recommendation: 'Amplify one primary focal point through scale, isolation, and contrast, then quiet surrounding regions.',
     };
 
-    const topRow = m.grid[0];
-    const topEdge = topRow.reduce((a, cell) => a + cell.meanEdge, 0) / topRow.length;
-    const hookRaw = clamp(topEdge / 45, 0, 1);
+    const hookRaw = clamp(topRatio * 0.55 + topCenterRatio * 0.25 + contrastNorm * 0.2 - busyPenalty * 0.15, 0, 1);
     cat.hook_visibility = {
       score: round(hookRaw * 15),
-      reason: hookRaw > 0.6
-        ? 'The upper third of the frame - what a thumb-scrolling viewer sees first - carries strong visual weight.'
-        : hookRaw > 0.3
-          ? 'The upper third has some visual activity but may not be strong enough to stop a scroll on its own.'
-          : 'The top of the frame is visually quiet. In a feed, viewers decide whether to keep scrolling before they reach the middle of the image.',
-      recommendation: 'Move your strongest visual or the headline into the top 40% of the frame - that is the zone that earns the scroll-stop.',
+      reason: hookRaw > 0.68
+        ? 'The upper portion of the ad carries enough visual energy to earn the first glance in-feed.'
+        : hookRaw > 0.4
+          ? 'There is some activity in the opening scan zone, but it may not be strong enough to consistently stop a scroll.'
+          : 'The top of the frame is comparatively quiet, so the ad likely asks the viewer to work too hard before the value appears.',
+      recommendation: 'Move your strongest claim, product cue, or contrast pop into the top 35% to 40% of the frame.',
     };
 
-    const centerCell = m.grid[1][1];
-    const centerRaw = clamp((centerCell.meanEdge / (meanCellEdge + 0.001)) / 2, 0, 1);
+    const productRaw = clamp(centerRatio * 0.45 + centeredness * 0.3 + focus * 0.25, 0, 1);
     cat.product_focus = {
-      score: round(centerRaw * 10),
-      reason: centerRaw > 0.6
-        ? 'The center of the frame - where product shots typically sit - carries clear visual presence.'
-        : centerRaw > 0.3
-          ? 'There is some visual weight at center frame, but it is not clearly dominant.'
-          : 'The center of the frame is comparatively quiet, which risks burying the product among competing elements.',
-      recommendation: 'Increase the product\'s scale relative to the frame, or isolate it against a simpler background so it reads as the obvious subject.',
+      score: round(productRaw * 10),
+      reason: productRaw > 0.66
+        ? 'The hero subject is visually established and sits where viewers naturally expect to find it.'
+        : productRaw > 0.38
+          ? 'The center carries some weight, but the subject does not fully dominate against nearby distractions.'
+          : 'The likely product zone is under-emphasized, making the creative feel more decorative than product-led.',
+      recommendation: 'Increase subject scale, simplify the background, or isolate the product with cleaner space around it.',
     };
 
-    const bottomCenter = m.grid[2][1];
-    const bottomRow = m.grid[2];
-    const bottomAvgExcl = (bottomRow[0].meanEdge + bottomRow[2].meanEdge) / 2;
-    const ctaPop = bottomCenter.meanEdge - bottomAvgExcl;
-    const ctaRaw = clamp(ctaPop / 25 + 0.3, 0, 1);
+    const ctaRaw = clamp((bottomCenterRatio - (m.zoneAverages.bottomSides / (m.avgEdge + 0.001))) * 0.65 + contrastNorm * 0.35 + 0.25, 0, 1);
     cat.cta_visibility = {
       score: round(ctaRaw * 10),
-      reason: ctaRaw > 0.65
-        ? 'A distinct, isolated element sits in the lower-center of the frame - consistent with a visible CTA button.'
-        : 'No strong, isolated element was detected in the CTA zone. This is a pixel-based estimate, so small CTA text or subtle buttons may still be present.',
-      recommendation: 'Place the CTA in the lower third, give it a solid contrasting fill, and keep at least 15 to 20px of clear space around it so it reads as tappable.',
+      reason: ctaRaw > 0.66
+        ? 'A lower-frame action zone stands apart clearly enough to read like a CTA destination.'
+        : ctaRaw > 0.38
+          ? 'There is some lower-third emphasis, but it is not isolated enough to feel strongly tappable.'
+          : 'No clearly isolated CTA zone surfaced in the lower third, so the action step is likely getting lost.',
+      recommendation: 'Give the CTA a dedicated contrasting shape, keep it in the lower third, and protect it with clear padding.',
     };
 
-    const vividness = clamp(m.avgSaturation * 1.4, 0, 1);
+    const paletteDiscipline = clamp(1 - (m.distinctColors - 12) / 26, 0, 1);
+    const brandRaw = clamp(
+      paletteDiscipline * 0.4 +
+      clamp(m.dominantColorShare * 2.4, 0, 1) * 0.25 +
+      clamp(cornerRatio / 1.4, 0, 1) * 0.35,
+      0,
+      1
+    );
+    cat.brand_presence = {
+      score: round(brandRaw * 5),
+      reason: brandRaw > 0.66
+        ? 'The composition suggests consistent brand control through disciplined palette use and a likely corner brand anchor.'
+        : brandRaw > 0.36
+          ? 'There are some brand cues, but they are not strongly reinforced by palette consistency or a clear mark location.'
+          : 'Brand cues appear weak or visually unstructured. Recall may suffer if the ad wins attention but not attribution.' + PIXEL_CAVEAT,
+      recommendation: 'Use one consistent brand color family and keep a small but deliberate logo or wordmark anchored in a corner.',
+    };
+
+    const vividness = clamp(m.avgSaturation * 1.1 + contrastNorm * 0.2 + focus * 0.15, 0, 1);
     cat.emotional_appeal = {
       score: round(vividness * 5),
-      reason: vividness > 0.6
-        ? 'Rich, saturated color palette that reads as energetic and attention-grabbing.'
-        : vividness > 0.3
-          ? 'Moderate color intensity - present but not particularly vivid.'
-          : 'Desaturated, muted palette. This can read as premium in the right category, or flat and low-energy in others.',
-      recommendation: 'If the brand allows it, push saturation on the hero subject specifically, not the whole frame, to draw the eye without looking artificial.' + PIXEL_CAVEAT,
+      reason: vividness > 0.64
+        ? 'The color and focal energy create an immediately lively, attention-seeking impression.'
+        : vividness > 0.34
+          ? 'The frame has some visual energy, but it is not especially vivid or emotionally charged.'
+          : 'The palette and contrast feel restrained enough that the ad risks reading flat unless the brand intentionally wants understated.',
+      recommendation: 'Push energy selectively on the hero subject instead of saturating the whole frame.' + PIXEL_CAVEAT,
     };
 
+    const copyPresence = clamp(m.textDensity / 0.11, 0, 1);
+    const copyDiscipline = 1 - clamp(Math.abs(m.textDensity - 0.11) / 0.11, 0, 1);
+    const offerRaw = clamp(contrastNorm * 0.25 + copyPresence * 0.2 + clamp(topCenterRatio / 1.45, 0, 1) * 0.35 + copyDiscipline * 0.2, 0, 1);
     cat.offer_clarity = {
-      score: 3,
-      reason: 'Offer clarity depends on reading the actual headline and price or promo copy, which pixel analysis cannot do reliably.' + PIXEL_CAVEAT,
-      recommendation: 'State the offer, price, discount, or benefit, in the first 3 to 4 words of on-image text. Do not make the viewer read a full sentence to find it.',
+      score: round(offerRaw * 5),
+      reason: offerRaw > 0.66
+        ? 'The composition suggests a readable headline or offer block in a place viewers will notice early.'
+        : offerRaw > 0.34
+          ? 'There are signals of offer copy, but its prominence or clarity likely is not as immediate as it should be.'
+          : 'The offer is probably not visually obvious enough. Either the copy block is too weak, too buried, or too fragmented.' + PIXEL_CAVEAT,
+      recommendation: 'Put the core benefit, discount, or headline into a compact high-contrast block near the top-center or center-left.',
     };
 
+    const trustRaw = clamp(
+      clamp(m.zoneAverages.bottomCorners / (m.avgEdge + 0.001), 0, 1.4) * 0.35 +
+      contrastNorm * 0.2 +
+      paletteDiscipline * 0.15 +
+      (1 - busyPenalty) * 0.3,
+      0,
+      1
+    );
     cat.trust_signals = {
-      score: 2,
-      reason: 'Detecting review stars, badges, or testimonial text requires semantic understanding of the image content.' + PIXEL_CAVEAT,
-      recommendation: 'Add a recognizable trust cue - star rating, review count, as-seen-in mention, or a guarantee badge - near the product or CTA.',
-    };
-
-    const brandRaw = clamp(m.distinctColors / 40, 0, 1);
-    cat.brand_presence = {
-      score: round(Math.min(brandRaw, 0.7) * 5),
-      reason: 'Logo and brand-mark detection needs semantic image understanding. This score is a rough color-palette proxy only.' + PIXEL_CAVEAT,
-      recommendation: 'Keep a logo or wordmark visible but small, under 10% of the frame, usually in a top corner or bottom bar so brand recall does not cost hierarchy.',
+      score: round(trustRaw * 5),
+      reason: trustRaw > 0.62
+        ? 'The lower support zones show room and structure for badges, proof points, or reassurance elements.'
+        : trustRaw > 0.32
+          ? 'Some support areas exist, but trust-building cues likely are not prominent enough to reinforce the conversion step.'
+          : 'Trust signals appear weak or absent. The frame does not strongly suggest reviews, badges, or reassurance copy near the action zone.' + PIXEL_CAVEAT,
+      recommendation: 'Add one compact proof element near the CTA or product: review stars, testimonial count, guarantee, or brand credibility badge.',
     };
 
     const ratioInfo = classifyAspectRatio(m.ratio);
-    const topZoneEdge = m.grid[0].reduce((a, cell) => a + cell.meanEdge, 0) / 3;
-    const bottomZoneEdge = m.grid[2].reduce((a, cell) => a + cell.meanEdge, 0) / 3;
-    const safeZoneRisk = clamp(((topZoneEdge + bottomZoneEdge) / 2) / 55, 0, 1);
-    const platformRaw = (ratioInfo.exactMatch ? 0.6 : 0.25) + (1 - safeZoneRisk) * 0.4;
+    const safeZoneRisk = Math.max(
+      ratioInfo.compatibility.story ? m.safeZoneActivity.story : 0,
+      ratioInfo.compatibility.reels ? m.safeZoneActivity.reels : 0,
+      ratioInfo.compatibility.feed ? m.safeZoneActivity.feed * 0.7 : 0
+    );
+    const platformRaw = clamp(ratioInfo.matchStrength * 0.68 + (1 - safeZoneRisk) * 0.32, 0, 1);
     cat.platform_readiness = {
-      score: round(clamp(platformRaw, 0, 1) * 5),
+      score: round(platformRaw * 5),
       reason: ratioInfo.exactMatch
-        ? `Matches a standard Meta placement ratio (${ratioInfo.nearest}).`
-        : `Ratio (${m.ratio.toFixed(2)}:1) does not cleanly match a standard placement, so Meta may letterbox or auto-crop it.`,
-      recommendation: ratioInfo.exactMatch
-        ? 'Double-check that key content sits inside the safe zone for Story or Reels if you plan to repurpose this creative into those placements.'
-        : `Export a version at exactly ${ratioInfo.nearest} to avoid automatic cropping.`,
+        ? `Matches a standard placement ratio (${ratioInfo.nearest}) and is closer to a reusable master export.`
+        : `The ratio (${m.ratio.toFixed(2)}:1) sits between standard placements, so cropping or letterboxing is likely.`,
+      recommendation: ratioInfo.compatibility.story || ratioInfo.compatibility.reels
+        ? 'Keep one standardized 1080x1920 master for both Story and Reels, then adjust only the safe content area per placement.'
+        : `Export a master at ${ratioInfo.standardizedSizes.feed} or ${ratioInfo.standardizedSizes.carousel} instead of relying on auto-crops.`,
     };
 
     return { categories: cat, ratioInfo, safeZoneRisk };
   }
 
-  function buildResult(m, scored) {
+  function composeResult(metrics, ratioInfo, categoryMap, overrides = {}) {
     const catList = AppConfig.CATEGORIES.map((def) => {
-      const s = scored.categories[def.key];
+      const source = categoryMap[def.key] || {};
       return {
         key: def.key,
         title: def.title,
-        score: clamp(s.score, 0, def.max),
+        score: clamp(round(source.score ?? 0), 0, def.max),
         max: def.max,
-        reason: s.reason,
-        recommendation: s.recommendation,
+        reason: source.reason || 'No explanation returned.',
+        recommendation: source.recommendation || 'No recommendation returned.',
       };
     });
 
     const overall = clamp(round(catList.reduce((sum, cat) => sum + cat.score, 0)), 0, 100);
     const rating = AppConfig.ratingFor(overall).label;
-
     const ranked = [...catList].sort((a, b) => (b.score / b.max) - (a.score / a.max));
-    const strengths = ranked.slice(0, 3).map((cat) => `${cat.title}: ${cat.reason}`);
-    const weaknesses = ranked.slice(-3).reverse().map((cat) => `${cat.title}: ${cat.reason}`);
-
-    const quickFixes = [...catList]
+    const strengths = overrides.strengths || ranked.slice(0, 3).map((cat) => `${cat.title}: ${cat.reason}`);
+    const weaknesses = overrides.weaknesses || ranked.slice(-3).reverse().map((cat) => `${cat.title}: ${cat.reason}`);
+    const quickFixes = overrides.quick_fixes || [...catList]
       .sort((a, b) => (a.score / a.max) - (b.score / b.max))
       .slice(0, 4)
       .map((cat) => cat.recommendation);
-
-    const improvements = [...catList]
+    const improvements = overrides.improvements || [...catList]
       .map((cat) => ({ title: cat.title, pointsLeft: cat.max - cat.score, text: cat.recommendation }))
       .sort((a, b) => b.pointsLeft - a.pointsLeft)
       .filter((cat) => cat.pointsLeft > 0)
       .slice(0, 6)
-      .map((cat) => `${cat.text} (+${cat.pointsLeft} pts potential in ${cat.title})`);
+      .map((cat) => `${cat.text} (+${round(cat.pointsLeft)} pts potential in ${cat.title})`);
 
     const ctrTiers = ['Low', 'Medium', 'High', 'Very High'];
-    const predictedCtr = ctrTiers[clamp(Math.floor(overall / 26), 0, 3)];
-    const predictedConversion = ctrTiers[clamp(Math.floor((overall - 5) / 26), 0, 3)];
-    const thumbStop = clamp(round((catList.find((cat) => cat.key === 'hook_visibility').score / 15) * 10), 0, 10);
-    const metaTextWarning = m.textDensity > 0.13;
-
-    const summary = `This creative scores ${overall}/100 (${rating}). ` +
+    const predictedCtr = overrides.predicted_ctr || ctrTiers[clamp(Math.floor(overall / 26), 0, 3)];
+    const predictedConversion = overrides.predicted_conversion || ctrTiers[clamp(Math.floor((overall - 5) / 26), 0, 3)];
+    const hookScore = catList.find((cat) => cat.key === 'hook_visibility')?.score || 0;
+    const thumbStop = clamp(round((hookScore / 15) * 10), 0, 10);
+    const summary = overrides.summary || (
+      `This creative scores ${overall}/100 (${rating}). ` +
       `${strengths.length ? strengths[0].split(':')[0] : 'Composition'} is the strongest area; ` +
-      `${weaknesses.length ? weaknesses[0].split(':')[0] : 'overall polish'} is the biggest opportunity. ` +
-      'This browser-based audit uses pixel analysis, so categories that depend on reading text or logos are flagged and scored conservatively.';
+      `${weaknesses.length ? weaknesses[0].split(':')[0] : 'overall polish'} is the biggest opportunity.`
+    );
 
     return {
-      mode: 'heuristic',
+      mode: overrides.mode || 'heuristic',
       overall_score: overall,
       rating,
       categories: catList,
@@ -370,19 +553,20 @@ const ImageAnalysis = (() => {
       improvements,
       predicted_ctr: predictedCtr,
       predicted_conversion: predictedConversion,
-      thumb_stop_rating: thumbStop,
-      meta_text_warning: metaTextWarning,
-      aspect_ratio: scored.ratioInfo,
-      metrics: m,
+      thumb_stop_rating: overrides.thumb_stop_rating ?? thumbStop,
+      meta_text_warning: overrides.meta_text_warning ?? metrics.textDensity > 0.13,
+      aspect_ratio: ratioInfo,
+      metrics,
+      ai_note: overrides.ai_note || '',
     };
   }
 
   function runHeuristicAnalysis(imgElement) {
     return new Promise((resolve) => {
       setTimeout(() => {
-        const m = extractMetrics(imgElement);
-        const scored = scoreHeuristically(m);
-        resolve(buildResult(m, scored));
+        const metrics = extractMetrics(imgElement);
+        const scored = scoreHeuristically(metrics);
+        resolve(composeResult(metrics, scored.ratioInfo, scored.categories, { mode: 'heuristic' }));
       }, 30);
     });
   }
@@ -399,5 +583,7 @@ const ImageAnalysis = (() => {
     runHeuristicAnalysis,
     extractMetrics,
     classifyAspectRatio,
+    scoreHeuristically,
+    composeResult,
   };
 })();
