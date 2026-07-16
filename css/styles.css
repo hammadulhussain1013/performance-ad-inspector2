@@ -85,6 +85,17 @@ select:focus-visible,
   color: #F5F6F8;
 }
 
+.analysis-mode-btn {
+  color: #B8BCC8;
+  background-color: transparent;
+}
+
+.analysis-mode-btn.active-analysis-mode {
+  background-color: rgba(60, 232, 176, 0.12);
+  border-color: rgba(60, 232, 176, 0.45) !important;
+  color: #F5F6F8;
+}
+
 /* --------------------------------------------------------------------
    Fade-up entrance for the results section
    -------------------------------------------------------------------- */
